@@ -11,7 +11,7 @@ We directly adapted this mechanism from Graves ([2016](#graves-2016)). At each i
 
 ## Pre-training
 
-We pretrain three models, tiny, small, and base, whose hyper-parameters are detailed below.
+We pretrain three models, [tiny](https://huggingface.co/asi/albert-act-tiny), [small](https://huggingface.co/asi/albert-act-small), and [base](https://huggingface.co/asi/albert-act-base), whose hyper-parameters are detailed below.
 
 | Models  | tiny | small | base |
 | :------------- | ------------- | ------------- | ------------- |
