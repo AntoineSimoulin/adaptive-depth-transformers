@@ -20,8 +20,8 @@ from __future__ import division
 from __future__ import print_function
 import os
 import time
-from albert import modeling
-from albert import optimization
+from . import modeling
+from . import optimization_with_acc
 from six.moves import range
 import tensorflow.compat.v1 as tf
 from tensorflow.contrib import cluster_resolver as contrib_cluster_resolver
@@ -264,14 +264,10 @@ def model_fn_builder(albert_config, init_checkpoint, learning_rate,
           "masked_lm_accuracy": masked_lm_accuracy,
           "masked_lm_loss": masked_lm_mean_loss,
           "n_updates_mean": n_updates_mean,
-          # "cosines_similarities": cosines_similarities
+          "cosines_similarities": cosines_similarities
         }
 
-        # cosines_similarities = tf.squeeze(tf.reduce_mean(cosines_similarities, axis=1))
-        # cosines_similarities = tf.squeeze(tf.reduce_mean(tf.expand_dims(cosines_similarities, axis=0), axis=0))
-        # cosines_similarities = tf.squeeze(tf.reduce_mean(cosines_similarities, axis=0))
-        cosines_similarities = tf.squeeze(tf.reduce_sum(cosines_similarities, axis=0))
-        cosines_similarities = tf.metrics.mean_tensor(cosines_similarities)
+        cosines_similarities = tf.squeeze(tf.reduce_mean(cosines_similarities, axis=1))
         for idx in range(cosines_similarities.shape[0]):
           metrics.update({
             "cosine_{}_{}".format(idx, idx + 1): tf.gather(cosines_similarities, idx),

@@ -19,7 +19,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 import re
-from albert import lamb_optimizer
+from . import lamb_optimizer
 import six
 from six.moves import zip
 import tensorflow.compat.v1 as tf
@@ -43,9 +43,6 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu,
       end_learning_rate=0.0,
       power=poly_power,
       cycle=False)
-
-  # Add learning rate to tensorboard  logs
-  tf.summary.scalar('learning_rate', learning_rate)
 
   # Implements linear warmup. I.e., if global_step - start_warmup_step <
   # num_warmup_steps, the learning rate will be
