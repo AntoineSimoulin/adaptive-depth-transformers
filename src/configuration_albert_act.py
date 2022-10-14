@@ -116,7 +116,6 @@ class AlbertActConfig(PretrainedConfig):
         embedding_size=128,
         hidden_size=4096,
         num_hidden_layers=12,
-        num_hidden_groups=1,
         num_attention_heads=64,
         intermediate_size=16384,
         inner_group_num=1,
@@ -141,7 +140,6 @@ class AlbertActConfig(PretrainedConfig):
         self.embedding_size = embedding_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_hidden_groups = num_hidden_groups
         self.num_attention_heads = num_attention_heads
         self.inner_group_num = inner_group_num
         self.hidden_act = hidden_act
