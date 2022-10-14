@@ -76,6 +76,61 @@ TF_ALBERT_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+@dataclass
+class TFActModelOutput(ModelOutput):
+    """
+    Base class for model's outputs, with potential hidden states and attentions.
+    Args:
+        last_hidden_state (`tf.Tensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+        hidden_states (`tuple(tf.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `tf.Tensor` (one for the output of the embeddings + one for the output of each layer) of shape
+            `(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (`tuple(tf.Tensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `tf.Tensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    last_hidden_state: tf.Tensor = None
+    hidden_states: Optional[Tuple[tf.Tensor]] = None
+    attentions: Optional[Tuple[tf.Tensor]] = None
+    updates: Optional[Tuple[tf.Tensor]] = None
+
+
+@dataclass
+class TFActModelOutputWithPooling(ModelOutput):
+    """
+    Base class for model's outputs that also contains a pooling of the last hidden states.
+    Args:
+        last_hidden_state (`tf.Tensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+        pooler_output (`tf.Tensor` of shape `(batch_size, hidden_size)`):
+            Last layer hidden-state of the first token of the sequence (classification token) further processed by a
+            Linear layer and a Tanh activation function. The Linear layer weights are trained from the next sentence
+            prediction (classification) objective during pretraining.
+            This output is usually *not* a good summary of the semantic content of the input, you're often better with
+            averaging or pooling the sequence of hidden-states for the whole input sequence.
+        hidden_states (`tuple(tf.Tensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `tf.Tensor` (one for the output of the embeddings + one for the output of each layer) of shape
+            `(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (`tuple(tf.Tensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `tf.Tensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    last_hidden_state: tf.Tensor = None
+    pooler_output: tf.Tensor = None
+    hidden_states: Optional[Tuple[tf.Tensor]] = None
+    attentions: Optional[Tuple[tf.Tensor]] = None
+    updates: Optional[Tuple[tf.Tensor]] = None
+    
+
 class TFAlbertPreTrainingLoss:
     """
     Loss function suitable for ALBERT pretraining, that is, the task of pretraining a language model by combining SOP +
@@ -251,7 +306,7 @@ class TFAlbertAttention(tf.keras.layers.Layer):
         self.dense = tf.keras.layers.Dense(
             units=config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
-        self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
+        # self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
         # Two different dropout probabilities; see https://github.com/google-research/albert/blob/master/modeling.py#L971-L993
         self.attention_dropout = tf.keras.layers.Dropout(rate=config.attention_probs_dropout_prob)
         self.output_dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
@@ -309,12 +364,12 @@ class TFAlbertAttention(tf.keras.layers.Layer):
         hidden_states = self_outputs[0]
         hidden_states = self.dense(inputs=hidden_states)
         hidden_states = self.output_dropout(inputs=hidden_states, training=training)
-        attention_output = self.LayerNorm(inputs=hidden_states + input_tensor)
+        # attention_output = self.LayerNorm(inputs=hidden_states + input_tensor)
 
         # add attentions if we output them
-        outputs = (attention_output,) + self_outputs[1:]
+        # outputs = (attention_output,) + self_outputs[1:]
 
-        return outputs
+        return hidden_states
 
 
 class TFAlbertAct(tf.keras.layers.Layer):
@@ -375,15 +430,18 @@ class TFAlbertActLayer(tf.keras.layers.Layer):
         super().__init__(**kwargs)
 
         self.attention = TFAlbertAttention(config, name="attention")
-        self.ffn = tf.keras.layers.Dense(
-            units=config.intermediate_size, kernel_initializer=get_initializer(config.initializer_range), name="ffn"
-        )
+        
         self.act = TFAlbertAct(config, name="act")
+        self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
 
         if isinstance(config.hidden_act, str):
             self.activation = get_tf_activation(config.hidden_act)
         else:
             self.activation = config.hidden_act
+
+        self.ffn = tf.keras.layers.Dense(
+            units=config.intermediate_size, kernel_initializer=get_initializer(config.initializer_range), name="ffn"
+        )
 
         self.ffn_output = tf.keras.layers.Dense(
             units=config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="ffn_output"
@@ -392,7 +450,7 @@ class TFAlbertActLayer(tf.keras.layers.Layer):
             epsilon=config.layer_norm_eps, name="full_layer_layer_norm"
         )
         self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
-
+        
     def call(
         self,
         hidden_states: tf.Tensor,
@@ -411,14 +469,16 @@ class TFAlbertActLayer(tf.keras.layers.Layer):
             output_attentions=output_attentions,
             training=training,
         )
-        ffn_output = self.ffn(inputs=attention_outputs[0])
+        update_weights, halting_probability, remainders, n_updates = self.act(
+            attention_outputs, halting_probability, remainders, n_updates) 
+        ffn_input = self.LayerNorm(inputs=(attention_outputs * update_weights) + (hidden_states * (1 - update_weights)))
+        # attention_output = self.LayerNorm(inputs=hidden_states + input_tensor)
+        ffn_output = self.ffn(inputs=ffn_input)
         ffn_output = self.activation(ffn_output)
-
-        ffn_output, halting_probability, remainders, n_updates = self.act(ffn_output, halting_probability, remainders, n_updates)
-
         ffn_output = self.ffn_output(inputs=ffn_output)
         ffn_output = self.dropout(inputs=ffn_output, training=training)
-        hidden_states = self.full_layer_layer_norm(inputs=ffn_output + attention_outputs[0])
+        # hidden_states = self.full_layer_layer_norm(inputs=ffn_output + attention_outputs[0])
+        ffn_output = self.full_layer_layer_norm((ffn_output * update_weights) + (attention_outputs * (1 - update_weights)))
 
         # add attentions if we output them
         # outputs = (hidden_states,) + attention_outputs[1:]
@@ -460,10 +520,10 @@ class TFAlbertActTransformer(tf.keras.layers.Layer):
         output_hidden_states: bool,
         return_dict: bool,
         training: bool = False,
-    ) -> Union[TFBaseModelOutput, Tuple[tf.Tensor]]:
+    ) -> Union[TFActModelOutput, Tuple[tf.Tensor]]:
         hidden_states = self.embedding_hidden_mapping_in(inputs=hidden_states)
-        # all_attentions = () if output_attentions else None
-        # all_hidden_states = (hidden_states,) if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        all_hidden_states = (hidden_states,) if output_hidden_states else None
 
         halting_probability = tf.zeros(tf.shape(hidden_states)[slice(0, 2)], name="halting_probability")
         remainders = tf.zeros(tf.shape(hidden_states)[slice(0, 2)], name="remainder")
@@ -478,14 +538,13 @@ class TFAlbertActTransformer(tf.keras.layers.Layer):
         n_updates = tf.math.multiply(n_updates, tf.cast(tf.math.greater(attention_mask, -1000), tf.float32))
         remainders = tf.math.multiply(remainders, tf.cast(tf.math.greater(attention_mask, -1000), tf.float32))
 
-        # if not return_dict:
-        #     return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions, n_updates] if v is not None)
 
-        # return TFBaseModelOutput(
-        #     last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
-        # )
-
-        return [hidden_states], n_updates
+        return TFActModelOutput(
+            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions,
+            updates=n_updates
+        )
 
 
 class TFAlbertActPreTrainedModel(TFPreTrainedModel):
@@ -655,7 +714,7 @@ class TFAlbertActMainLayer(tf.keras.layers.Layer):
         else:
             head_mask = [None] * self.config.num_hidden_layers
 
-        encoder_outputs, n_updates = self.encoder(
+        encoder_outputs = self.encoder(
             hidden_states=embedding_output,
             attention_mask=extended_attention_mask,
             head_mask=head_mask,
@@ -673,15 +732,15 @@ class TFAlbertActMainLayer(tf.keras.layers.Layer):
             return (
                 sequence_output,
                 pooled_output,
-                n_updates,
-            )# + encoder_outputs[1:]
+            ) + encoder_outputs[1:]
 
-        return TFBaseModelOutputWithPooling(
+        return TFActModelOutputWithPooling(
             last_hidden_state=sequence_output,
             pooler_output=pooled_output,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
-        )
+            updates=encoder_outputs.updates,
+         )
 
 
 @dataclass
