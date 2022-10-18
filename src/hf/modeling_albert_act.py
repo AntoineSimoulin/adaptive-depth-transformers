@@ -377,30 +377,29 @@ class AlbertActLayer(nn.Module):
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         attention_outputs = self.attention(hidden_states, attention_mask, head_mask, output_attentions)
-        
-        update_weights, halting_probability, remainders, n_updates = self.act(
-            attention_outputs[0], halting_probability, remainders, n_updates)
-        ffn_input = self.LayerNorm(\
-           (attention_outputs[0] * update_weights.unsqueeze(-1).repeat(1, 1, attention_outputs[0].shape[-1])) + \
-           (hidden_states * (1 - update_weights.unsqueeze(-1).repeat(1, 1, hidden_states.shape[-1]))))
-
+        ffn_input = self.LayerNorm(attention_outputs[0] + hidden_states)
         ffn_output = apply_chunking_to_forward(
             self.ff_chunk,
             self.chunk_size_feed_forward,
             self.seq_len_dim,
             ffn_input,
         )
-        hidden_states = self.full_layer_layer_norm(\
-          (ffn_output * update_weights.unsqueeze(-1).repeat(1, 1, ffn_output.shape[-1])) + \
-          (ffn_input * (1 - update_weights.unsqueeze(-1).repeat(1, 1, ffn_input.shape[-1]))))
+        ffn_output = self.full_layer_layer_norm(ffn_output + ffn_input)
 
+        update_weights, halting_probability, remainders, n_updates = self.act(
+            ffn_output, halting_probability, remainders, n_updates)
         # return (hidden_states,) + attention_outputs[1:]  # add attentions if we output them
-        return hidden_states, halting_probability, remainders, n_updates
+
+        ffn_output = ffn_output * update_weights.unsqueeze(-1).repeat(1, 1, ffn_output.shape[-1]) + \
+            hidden_states * (1 - update_weights.unsqueeze(-1).repeat(1, 1, hidden_states.shape[-1]))
+
+        return ffn_output, halting_probability, remainders, n_updates
 
     def ff_chunk(self, attention_output: torch.Tensor) -> torch.Tensor:
         ffn_output = self.ffn(attention_output)
         ffn_output = self.activation(ffn_output)
         ffn_output = self.ffn_output(ffn_output)
+        ffn_output = self.dropout(ffn_output)
         return ffn_output
 
 

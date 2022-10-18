@@ -469,16 +469,21 @@ class TFAlbertActLayer(tf.keras.layers.Layer):
             output_attentions=output_attentions,
             training=training,
         )
-        update_weights, halting_probability, remainders, n_updates = self.act(
-            attention_outputs, halting_probability, remainders, n_updates) 
-        ffn_input = self.LayerNorm(inputs=(attention_outputs * update_weights) + (hidden_states * (1 - update_weights)))
+        
+        ffn_input = self.LayerNorm(attention_outputs + hidden_states)
         # attention_output = self.LayerNorm(inputs=hidden_states + input_tensor)
         ffn_output = self.ffn(inputs=ffn_input)
         ffn_output = self.activation(ffn_output)
         ffn_output = self.ffn_output(inputs=ffn_output)
         ffn_output = self.dropout(inputs=ffn_output, training=training)
         # hidden_states = self.full_layer_layer_norm(inputs=ffn_output + attention_outputs[0])
-        ffn_output = self.full_layer_layer_norm((ffn_output * update_weights) + (ffn_input * (1 - update_weights)))
+        ffn_output = self.full_layer_layer_norm(ffn_output + ffn_input)
+
+        update_weights, halting_probability, remainders, n_updates = \
+              self.act(ffn_output, halting_probability, remainders, n_updates)
+        ffn_output = ffn_output * update_weights + hidden_states * (1 - update_weights)
+
+        # ffn_output = self.full_layer_layer_norm((ffn_output * update_weights) + (ffn_input * (1 - update_weights)))
 
         # add attentions if we output them
         # outputs = (hidden_states,) + attention_outputs[1:]
@@ -504,10 +509,12 @@ class TFAlbertActTransformer(tf.keras.layers.Layer):
         self.albert_layer= TFAlbertActLayer(config, name="albert_layer")
 
     def should_continue(self, u0, u1, halting_probability, u2, n_updates):
+        # del u0, u1, u2
         cond = tf.reduce_any(
             tf.math.logical_and(
                 tf.math.less(halting_probability, self.threshold),
                 tf.math.less(n_updates, self.num_hidden_layers)))
+        # print("should continue:", cond)
         return cond
 
     def call(
