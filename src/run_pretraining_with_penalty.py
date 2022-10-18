@@ -27,6 +27,7 @@ import tensorflow.compat.v1 as tf
 from tensorflow.contrib import cluster_resolver as contrib_cluster_resolver
 from tensorflow.contrib import data as contrib_data
 from tensorflow.contrib import tpu as contrib_tpu
+from tensorflow.contrib import summary as contrib_summary
 
 flags = tf.flags
 
@@ -129,10 +130,11 @@ flags.DEFINE_float(
     "for offline masking")
 
 
-def model_fn_builder(albert_config, init_checkpoint, learning_rate,
+def model_fn_builder(albert_config, init_checkpoint, init_lr,
                      num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings, optimizer, poly_power,
-                     start_warmup_step, num_accumulation_steps, model_dir=""):
+                     use_one_hot_embeddings, optimizer_name, poly_power,
+                     start_warmup_step, num_accumulation_steps, model_dir="", tau=0.01,
+                     vocab_upos="", vocab_deps="", mask_token_id=4, cls_token_id=2, sep_token_id=3, eps=1e-8):
   """Returns `model_fn` closure for TPUEstimator."""
 
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -173,13 +175,30 @@ def model_fn_builder(albert_config, init_checkpoint, learning_rate,
 
     n_updates = model.get_n_updates()
     cosines_similarities = model.get_cosines_similarities()
+    time_penalty = model.get_time_penaly() * tau
+    time_penalty_loss = tf.reduce_mean(time_penalty)
+
+    sentence_input_tensor = model.get_pooled_output()
+    if mode == tf.estimator.ModeKeys.EVAL:
+      # We filter the dev sentences used for evaluation only
+      # The label for such sentences is -1.
+      sentence_with_label_index = tf.where(sentence_order_labels >= 0)
+      sentence_with_label_index = tf.gather_nd(
+        tf.math.cumsum(tf.ones_like(sentence_order_labels)) - 1, sentence_with_label_index)
+      sentence_with_label_index = tf.reshape(sentence_with_label_index, [-1, 1])
+      sentence_input_tensor = tf.gather_nd(sentence_input_tensor, sentence_with_label_index)
+
+      sentence_order_labels = tf.gather_nd(sentence_order_labels, tf.where(sentence_order_labels >= 0))
+      sentence_order_labels = tf.reshape(sentence_order_labels, [-1, 1])
 
     (sentence_order_loss, sentence_order_example_loss,
      sentence_order_log_probs) = get_sentence_order_output(
-         albert_config, model.get_pooled_output(), sentence_order_labels)
+         albert_config, sentence_input_tensor, sentence_order_labels)
 
-    total_loss = masked_lm_loss + sentence_order_loss
 
+    total_loss = masked_lm_loss + sentence_order_loss + time_penalty_loss
+
+    # hook not compatibles with TPU workflow
     # logging_hook = tf.train.LoggingTensorHook(
     #     {"loss": total_loss,
     #      "masked_lm_loss": masked_lm_loss,
@@ -225,25 +244,252 @@ def model_fn_builder(albert_config, init_checkpoint, learning_rate,
       tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
                       init_string)
 
-    output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps,
-          use_tpu, optimizer, poly_power, start_warmup_step, num_accumulation_steps)
+      learning_rate = optimization._get_learning_rate(
+        init_lr, num_train_steps, num_warmup_steps, poly_power, start_warmup_step)
+      optimizer = optimization._get_optimizer(learning_rate, use_tpu, optimizer_name)
+      train_op = optimization._get_train_op(total_loss, optimizer, num_accumulation_steps)
+      global_step = tf.train.get_global_step()
+
+      def host_call_fn(global_step, learning_rate,
+                       total_loss, masked_lm_loss, sentence_order_loss, time_penalty_loss):
+        # Outfeed supports int32 but global_step is expected to be int64.
+        global_step = tf.reduce_mean(global_step)
+        with (contrib_summary.create_file_writer(
+                os.path.join(model_dir, 'train')).as_default()):
+          with contrib_summary.always_record_summaries():
+            contrib_summary.scalar(
+              'learning_rate', tf.reduce_mean(learning_rate), step=global_step)
+            contrib_summary.scalar(
+              'loss/total', tf.reduce_mean(total_loss), step=global_step)
+            contrib_summary.scalar(
+              'loss/masked_lm', tf.reduce_mean(masked_lm_loss), step=global_step)
+            contrib_summary.scalar(
+              'loss/sentence_order', tf.reduce_mean(sentence_order_loss), step=global_step)
+            contrib_summary.scalar(
+              'loss/time_penalty', tf.reduce_mean(time_penalty_loss), step=global_step)
+            return contrib_summary.all_summary_ops()
+
+      # To log the loss, current learning rate, and epoch for Tensorboard, the
+      # summary op needs to be run on the host CPU via host_call. host_call
+      # expects [batch_size, ...] Tensors, thus reshape to introduce a batch
+      # dimension. These Tensors are implicitly concatenated to
+      # [params['batch_size']].
+      global_step_t = tf.reshape(global_step, [1])
+      learning_rate_t = tf.reshape(learning_rate, [1])
+      total_loss_t = tf.reshape(total_loss, [1])
+      masked_lm_loss_t = tf.reshape(masked_lm_loss, [1])
+      sentence_order_loss_t = tf.reshape(sentence_order_loss, [1])
+      time_penalty_loss_t = tf.reshape(time_penalty_loss, [1])
+
+      host_call = (host_call_fn,
+                   [global_step_t, learning_rate_t,
+                    total_loss_t, masked_lm_loss_t, sentence_order_loss_t, time_penalty_loss_t])
 
       output_spec = contrib_tpu.TPUEstimatorSpec(
           mode=mode,
           loss=total_loss,
           train_op=train_op,
+          # host_call=host_call, # working but makes training x4 times slower due to CPU/TPU overhead
           # training_hooks=[logging_hook],
           scaffold_fn=scaffold_fn)
+
     elif mode == tf.estimator.ModeKeys.EVAL:
+
+      upos_ids = features["upos_ids"]
+      deps_ids = features["deps_ids"]
+
+      vocab_upos_list = load_conll_encoder(vocab_upos)
+      vocab_deps_list = load_conll_encoder(vocab_deps)
+      upos_2_idx = {upos: idx for (idx, upos) in enumerate(vocab_upos_list, 1)}
+      deps_2_idx = {deps: idx for (idx, deps) in enumerate(vocab_deps_list, 1)}
 
       def metric_fn(*args):
         """Computes the loss and accuracy of the model."""
         (masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
          masked_lm_weights, sentence_order_example_loss,
-         sentence_order_log_probs, sentence_order_labels, n_updates, cosines_similarities) = args[:9]
+         sentence_order_log_probs, sentence_order_labels,
+         n_updates, cosines_similarities, upos_ids, deps_ids, masked_lm_positions, input_ids) = args[:13]
+
+        # n_updates_weights = tf.constant(n_updates.get_shape().as_list()[0] * n_updates.get_shape().as_list()[1])
+        # n_updates_weights = tf.math.count_nonzero(n_updates, dtype=tf.float32)
+        # n_updates_mean = tf.metrics.mean(values=tf.reduce_sum(n_updates)/n_updates_weights)
+        n_updates_all_mean = tf.where(
+          input_ids > 0, n_updates, tf.ones_like(n_updates, dtype=tf.float32) * -1)
+        n_updates_all_mean = tf.metrics.mean(
+          tf.gather_nd(n_updates_all_mean, tf.where(n_updates_all_mean >= 0)))
+
+        n_updates_mask_mean = tf.where(
+          tf.equal(input_ids, tf.ones_like(input_ids, dtype=tf.int32) * mask_token_id),
+          tf.where(input_ids > 0, n_updates, tf.ones_like(n_updates, dtype=tf.float32) * -1),
+          tf.ones_like(n_updates, dtype=tf.float32) * -1)
+        n_updates_mask_mean = tf.metrics.mean(
+          tf.gather_nd(n_updates_mask_mean, tf.where(n_updates_mask_mean >= 0)))
+
+        n_updates_no_mask_mean = tf.where(
+          tf.not_equal(input_ids, tf.ones_like(input_ids, dtype=tf.int32) * mask_token_id),
+          tf.where(input_ids > 0, n_updates, tf.ones_like(n_updates, dtype=tf.float32) * -1),
+          tf.ones_like(n_updates, dtype=tf.float32) * -1)
+        n_updates_no_mask_mean = tf.metrics.mean(
+          tf.gather_nd(n_updates_no_mask_mean, tf.where(n_updates_no_mask_mean >= 0)))
+
+        n_updates_cls_mean = tf.where(
+          tf.equal(input_ids, tf.ones_like(input_ids, dtype=tf.int32) * cls_token_id),
+          tf.where(input_ids > 0, n_updates, tf.ones_like(n_updates, dtype=tf.float32) * -1),
+          tf.ones_like(n_updates, dtype=tf.float32) * -1)
+        n_updates_cls_mean = tf.metrics.mean(
+          tf.gather_nd(n_updates_cls_mean, tf.where(n_updates_cls_mean >= 0)))
+
+        n_updates_sep_mean = tf.where(
+          tf.equal(input_ids, tf.ones_like(input_ids, dtype=tf.int32) * sep_token_id),
+          tf.where(input_ids > 0, n_updates, tf.ones_like(n_updates, dtype=tf.float32) * -1),
+          tf.ones_like(n_updates, dtype=tf.float32) * -1)
+        n_updates_sep_mean = tf.metrics.mean(
+          tf.gather_nd(n_updates_sep_mean, tf.where(n_updates_sep_mean >= 0)))
+
+        time_penalty_metric = tf.metrics.mean(time_penalty)
+
+        metrics = {
+		      "loss/time_penalty": time_penalty_metric,
+          "n_updates_global/all": n_updates_all_mean,
+          "n_updates_global/no_mask": n_updates_no_mask_mean,
+          "n_updates_global/mask": n_updates_mask_mean,
+          "n_updates_global/cls": n_updates_cls_mean,
+          "n_updates_global/sep": n_updates_sep_mean,
+          # "cosines_similarities": cosines_similarities
+        }
+
+        # cosines_similarities = tf.squeeze(tf.reduce_mean(cosines_similarities, axis=1))
+        # cosines_similarities = tf.squeeze(tf.reduce_mean(tf.expand_dims(cosines_similarities, axis=0), axis=0))
+        # cosines_similarities = tf.squeeze(tf.reduce_mean(cosines_similarities, axis=0))
+
+        for idx in range(cosines_similarities.get_shape().as_list()[2]):
+          cosines_similarities_step = tf.squeeze(cosines_similarities[:, :, idx])
+
+          cosines_similarities_all_mean = tf.where(
+            input_ids > 0, cosines_similarities_step, tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1)
+          cosines_similarities_all_mean = tf.metrics.mean(
+            tf.gather_nd(cosines_similarities_all_mean, tf.where(cosines_similarities_all_mean >= 0)))
+
+          cosines_similarities_mask_mean = tf.where(
+            tf.equal(input_ids, tf.ones_like(input_ids, dtype=tf.int32) * mask_token_id),
+            tf.where(input_ids > 0, cosines_similarities_step, tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1),
+            tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1)
+          cosines_similarities_mask_mean = tf.metrics.mean(
+            tf.gather_nd(cosines_similarities_mask_mean, tf.where(cosines_similarities_mask_mean >= 0)))
+
+          cosines_similarities_no_mask_mean = tf.where(
+            tf.not_equal(input_ids, tf.ones_like(input_ids, dtype=tf.int32) * mask_token_id),
+            tf.where(input_ids > 0, cosines_similarities_step, tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1),
+            tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1)
+          cosines_similarities_no_mask_mean = tf.metrics.mean(
+            tf.gather_nd(cosines_similarities_no_mask_mean, tf.where(cosines_similarities_no_mask_mean >= 0)))
+
+          cosines_similarities_cls_mean = tf.where(
+            tf.equal(input_ids, tf.ones_like(input_ids, dtype=tf.int32) * cls_token_id),
+            tf.where(input_ids > 0, cosines_similarities_step, tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1),
+            tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1)
+          cosines_similarities_cls_mean = tf.metrics.mean(
+            tf.gather_nd(cosines_similarities_cls_mean, tf.where(cosines_similarities_cls_mean >= 0)))
+
+          cosines_similarities_sep_mean = tf.where(
+            tf.equal(input_ids, tf.ones_like(input_ids, dtype=tf.int32) * sep_token_id),
+            tf.where(input_ids > 0, cosines_similarities_step, tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1),
+            tf.ones_like(cosines_similarities_step, dtype=tf.float32) * -1)
+          cosines_similarities_sep_mean = tf.metrics.mean(
+            tf.gather_nd(cosines_similarities_sep_mean, tf.where(cosines_similarities_sep_mean >= 0)))
+
+          metrics.update({
+            "cosine_all/{}_{}".format(idx, idx + 1): cosines_similarities_all_mean,
+            "cosine_mask/{}_{}".format(idx, idx + 1): cosines_similarities_mask_mean,
+            "cosine_no_mask/{}_{}".format(idx, idx + 1): cosines_similarities_no_mask_mean,
+            "cosine_cls/{}_{}".format(idx, idx + 1): cosines_similarities_cls_mean,
+            "cosine_sep/{}_{}".format(idx, idx + 1): cosines_similarities_sep_mean,
+          })
+
+        # cosines_similarities_weights = tf.constant(cosines_similarities.get_shape().as_list()[0], dtype=tf.float32)
+        # cosines_similarities = tf.squeeze(tf.reduce_sum(cosines_similarities, axis=0))
+        # for idx in range(cosines_similarities.get_shape().as_list()[0]):
+          # cosines_similarities_metric = tf.metrics.mean(
+          #   values=tf.gather(cosines_similarities, idx)/(cosines_similarities_weights + eps))
+          # metrics.update({
+          #   "cosine/{}_{}".format(idx, idx + 1): cosines_similarities_metric,
+          # })
+
+        sentence_order_log_probs = tf.reshape(
+          sentence_order_log_probs, [-1, sentence_order_log_probs.shape[-1]])
+        sentence_order_predictions = tf.argmax(
+          sentence_order_log_probs, axis=-1, output_type=tf.int32)
+        sentence_order_labels = tf.reshape(sentence_order_labels, [-1])
+        sentence_order_accuracy = tf.metrics.accuracy(
+          labels=sentence_order_labels,
+          predictions=sentence_order_predictions)
+        sentence_order_mean_loss = tf.metrics.mean(
+          values=sentence_order_example_loss)
+        metrics.update({
+          "metrics/sentence_order_acc": sentence_order_accuracy,
+          "loss/sentence_order": sentence_order_mean_loss
+        })
+
+        upos_metrics = {}
+        for (k, v) in upos_2_idx.items():
+          upos_idx = tf.where(tf.equal(upos_ids, v))
+          upos_metrics[k] = tf.metrics.mean(tf.gather_nd(n_updates, upos_idx))
+          metrics.update({"n_updates_upos/{}".format(k): upos_metrics[k]})
+
+        deps_metrics = {}
+        for (k, v) in deps_2_idx.items():
+          deps_idx = tf.where(tf.equal(deps_ids, v))
+          deps_metrics[k] = tf.metrics.mean(tf.gather_nd(n_updates, deps_idx))
+          metrics.update({"n_updates_deps/{}".format(k): deps_metrics[k]})
+
+        # log number of updates for:
+        # MASK tokens replaced with MASK
+        mask_input_ids = tf.gather(input_ids, masked_lm_positions, axis=1, batch_dims=1)
+        true_mask_tokens = tf.equal(mask_input_ids, tf.ones_like(mask_input_ids, dtype=tf.int32) * mask_token_id)
+        true_mask_idx = tf.where(true_mask_tokens,
+                                 masked_lm_positions,
+                                 tf.zeros_like(masked_lm_positions, dtype=tf.int32))
+        true_mask_updates = tf.gather(n_updates, true_mask_idx, axis=1, batch_dims=1)
+        true_mask_updates = tf.where(true_mask_idx > 0,
+                                     true_mask_updates,
+                                     tf.ones_like(masked_lm_positions, dtype=tf.float32) * -1)
+        true_mask_updates = tf.where(masked_lm_positions > 0,
+                                     true_mask_updates,
+                                     tf.ones_like(masked_lm_positions, dtype=tf.float32) * -1)
+        true_mask_metric = tf.metrics.mean(tf.gather_nd(true_mask_updates, tf.where(true_mask_updates >= 0)))
+        metrics.update({"n_updates_mask/mask": true_mask_metric})
+
+        # MASK token replaced with random word
+
+        switch_mask_tokens = tf.not_equal(mask_input_ids, masked_lm_ids)
+        switch_mask_idx = tf.where(switch_mask_tokens,
+                                   masked_lm_positions,
+                                   tf.zeros_like(masked_lm_positions, dtype=tf.int32))
+        switch_mask_updates = tf.gather(n_updates, switch_mask_idx, axis=1, batch_dims=1)
+        switch_mask_updates = tf.where(switch_mask_idx > 0,
+                                       switch_mask_updates,
+                                       tf.ones_like(masked_lm_positions, dtype=tf.float32) * -1)
+        switch_mask_updates = tf.where(masked_lm_positions > 0,
+                                     switch_mask_updates,
+                                     tf.ones_like(masked_lm_positions, dtype=tf.float32) * -1)
+        switch_mask_metric = tf.metrics.mean(tf.gather_nd(switch_mask_updates, tf.where(switch_mask_updates >= 0)))
+        metrics.update({"n_updates_mask/random": switch_mask_metric})
+
+        # MASK tokens not replaced
+        false_mask_tokens = tf.equal(mask_input_ids, masked_lm_ids)
+        false_mask_idx = tf.where(false_mask_tokens,
+                                  masked_lm_positions,
+                                  tf.zeros_like(masked_lm_positions, dtype=tf.int32))
+        false_mask_updates = tf.gather(n_updates, false_mask_idx, axis=1, batch_dims=1)
+        false_mask_updates = tf.where(false_mask_idx > 0,
+                                      false_mask_updates,
+                                      tf.ones_like(masked_lm_positions, dtype=tf.float32) * -1)
+        false_mask_updates = tf.where(masked_lm_positions > 0,
+                                     false_mask_updates,
+                                     tf.ones_like(masked_lm_positions, dtype=tf.float32) * -1)
+        false_mask_metric = tf.metrics.mean(tf.gather_nd(false_mask_updates, tf.where(false_mask_updates >= 0)))
+        metrics.update({"n_updates_mask/token": false_mask_metric})
 
         masked_lm_log_probs = tf.reshape(masked_lm_log_probs,
                                          [-1, masked_lm_log_probs.shape[-1]])
@@ -259,51 +505,16 @@ def model_fn_builder(albert_config, init_checkpoint, learning_rate,
         masked_lm_mean_loss = tf.metrics.mean(
           values=masked_lm_example_loss, weights=masked_lm_weights)
 
-        # n_updates_weights = tf.constant(n_updates.get_shape().as_list()[0] * n_updates.get_shape().as_list()[1])
-        n_updates_weights = tf.math.count_nonzero(n_updates, dtype=tf.float32)
-        n_updates = tf.reduce_sum(n_updates)
-        n_updates_mean = tf.metrics.mean(values=n_updates/n_updates_weights)
+        metrics.update({"metrics/masked_lm_acc": masked_lm_accuracy})
+        metrics.update({"loss/masked_lm": masked_lm_mean_loss})
 
-        metrics = {
-          "masked_lm/accuracy": masked_lm_accuracy,
-          "masked_lm/loss": masked_lm_mean_loss,
-          "n_updates_mean": n_updates_mean,
-          # "cosines_similarities": cosines_similarities
-        }
-
-        # cosines_similarities = tf.squeeze(tf.reduce_mean(cosines_similarities, axis=1))
-        # cosines_similarities = tf.squeeze(tf.reduce_mean(tf.expand_dims(cosines_similarities, axis=0), axis=0))
-        # cosines_similarities = tf.squeeze(tf.reduce_mean(cosines_similarities, axis=0))
-        cosines_similarities_weights = tf.constant(cosines_similarities.get_shape().as_list()[0], dtype=tf.float32)
-        cosines_similarities = tf.squeeze(tf.reduce_sum(cosines_similarities, axis=0))
-        for idx in range(cosines_similarities.get_shape().as_list()[0]):
-          cosines_similarities_metric = tf.metrics.mean(
-            values=tf.gather(cosines_similarities, idx)/cosines_similarities_weights)
-          metrics.update({
-            "cosine/{}_{}".format(idx, idx + 1): cosines_similarities_metric,
-          })
-
-        sentence_order_log_probs = tf.reshape(
-          sentence_order_log_probs, [-1, sentence_order_log_probs.shape[-1]])
-        sentence_order_predictions = tf.argmax(
-          sentence_order_log_probs, axis=-1, output_type=tf.int32)
-        sentence_order_labels = tf.reshape(sentence_order_labels, [-1])
-        sentence_order_accuracy = tf.metrics.accuracy(
-          labels=sentence_order_labels,
-          predictions=sentence_order_predictions)
-        sentence_order_mean_loss = tf.metrics.mean(
-          values=sentence_order_example_loss)
-        metrics.update({
-          "sentence_order/accuracy": sentence_order_accuracy,
-          "sentence_order/loss": sentence_order_mean_loss
-        })
         return metrics
 
       metric_values = [
         masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
         masked_lm_weights, sentence_order_example_loss,
         sentence_order_log_probs, sentence_order_labels,
-        n_updates, cosines_similarities
+        n_updates, cosines_similarities, upos_ids, deps_ids, masked_lm_positions, input_ids
       ]
 
       eval_metrics = (metric_fn, metric_values)
@@ -398,7 +609,12 @@ def get_sentence_order_output(albert_config, input_tensor, labels):
     labels = tf.reshape(labels, [-1])
     one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
-    loss = tf.reduce_mean(per_example_loss)
+
+    numerator = tf.reduce_sum(per_example_loss)
+    denominator = tf.cast(tf.size(labels), tf.float32) + 1e-5
+    loss = numerator / denominator
+    # loss = tf.reduce_mean(per_example_loss)
+
     return (loss, per_example_loss, log_probs)
 
 
@@ -422,7 +638,8 @@ def input_fn_builder(input_files,
                      max_seq_length,
                      max_predictions_per_seq,
                      is_training,
-                     num_cpu_threads=4):
+                     num_cpu_threads=4,
+                     add_dep_and_pos=False):
   """Creates an `input_fn` closure to be passed to TPUEstimator."""
 
   def input_fn(params):
@@ -438,6 +655,12 @@ def input_fn_builder(input_files,
         # the ALBERT case it does represent sentence_order_labels.
         "next_sentence_labels": tf.FixedLenFeature([1], tf.int64),
     }
+
+    if add_dep_and_pos:
+      name_to_features.update(
+        {"upos_ids": tf.FixedLenFeature([max_seq_length], tf.int64, default_value=[0] * max_seq_length)})
+      name_to_features.update(
+        {"deps_ids": tf.FixedLenFeature([max_seq_length], tf.int64, default_value=[0] * max_seq_length)})
 
     # if FLAGS.masked_lm_budget:
     #   name_to_features.update({
@@ -505,6 +728,13 @@ def _decode_record(record, name_to_features):
     example[name] = t
 
   return example
+
+
+def load_conll_encoder(vocab_path):
+  with open(os.path.join(vocab_path), 'r') as f:
+      conll_keys = f.readlines()
+  conll_keys = [k.rstrip('\n') for k in conll_keys]
+  return conll_keys
 
 
 def main(_):
