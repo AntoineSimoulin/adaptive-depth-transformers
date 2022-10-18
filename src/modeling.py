@@ -227,6 +227,7 @@ class AlbertModel(object):
                     input_tensor=self.embedding_output,
                     attention_mask=input_mask,
                     hidden_size=config.hidden_size,
+                    act_max_steps=config.num_hidden_layers,
                     num_hidden_layers=config.num_hidden_layers,
                     num_hidden_groups=config.num_hidden_groups,
                     num_attention_heads=config.num_attention_heads,
@@ -379,6 +380,14 @@ def get_assignment_map_from_checkpoint(tvars, init_checkpoint, num_of_group=0):
                      six.ensure_str(name)) in init_vars_name and
               num_of_group > 1):
             tvar_name = re.sub(r"/group_\d+/", "/group_0/", six.ensure_str(name))
+        elif re.sub(r"/sigmoid_activation_for_pondering/", "/halting/", six.ensure_str(name)) in init_vars_name:
+          tvar_name = re.sub(r"/sigmoid_activation_for_pondering/", "/halting/", six.ensure_str(name))
+        elif re.sub(r"/layer_normalization/", "/LayerNorm/", six.ensure_str(name)) in init_vars_name:
+          tvar_name = re.sub(r"/layer_normalization/", "/LayerNorm/", six.ensure_str(name))
+        elif "bert/encoder/" + re.sub(r"/layer_normalization/", "/LayerNorm/", six.ensure_str(name)) in init_vars_name:
+          tvar_name = "bert/encoder/" + re.sub(r"/layer_normalization/", "/LayerNorm/", six.ensure_str(name))
+        elif "bert/encoder/" + re.sub(r"/layer_normalization_1/", "/LayerNorm_1/", six.ensure_str(name)) in init_vars_name:
+          tvar_name = "bert/encoder/" + re.sub(r"/layer_normalization_1/", "/LayerNorm_1/", six.ensure_str(name))
         elif (re.sub(r"/ffn_\d+/", "/ffn_1/", six.ensure_str(name))
               in init_vars_name and num_of_group > 1):
             tvar_name = re.sub(r"/ffn_\d+/", "/ffn_1/", six.ensure_str(name))
@@ -386,21 +395,6 @@ def get_assignment_map_from_checkpoint(tvars, init_checkpoint, num_of_group=0):
               in init_vars_name and num_of_group > 1):
             tvar_name = re.sub(r"/attention_\d+/", "/attention_1/",
                                six.ensure_str(name))
-        else:
-            tf.logging.info("name %s does not get matched", name)
-            continue
-        tf.logging.info("name %s match to %s", name, tvar_name)
-        if num_of_group > 0:
-            group_matched = False
-            for gid in range(1, num_of_group):
-                if (("/group_" + str(gid) + "/" in name) or
-                        ("/ffn_" + str(gid) + "/" in name) or
-                        ("/attention_" + str(gid) + "/" in name)):
-                    group_matched = True
-                    tf.logging.info("%s belongs to %dth", name, gid)
-                    assignment_map[gid][tvar_name] = name
-            if not group_matched:
-                assignment_map[0][tvar_name] = name
         else:
             assignment_map[tvar_name] = name
         initialized_variable_names[name] = 1
@@ -1296,9 +1290,11 @@ def transformer_model_with_act(
 
             ffn_output_normed = tf.linalg.normalize(ffn_output, ord='euclidean', axis=2)[0]
             layer_input_normed = tf.linalg.normalize(layer_input, ord='euclidean', axis=2)[0]
-            cosine_distance = tf.reduce_mean(
-                tf.squeeze(
-                    tf.losses.cosine_distance(layer_input_normed, ffn_output_normed, axis=2, reduction="none")), axis=1)
+            # cosine_distance = tf.reduce_mean(
+            #     tf.squeeze(
+            #         tf.losses.cosine_distance(layer_input_normed, ffn_output_normed, axis=2, reduction="none")), axis=1)
+            cosine_distance = tf.squeeze(tf.reduce_mean(
+                    tf.losses.cosine_distance(layer_input_normed, ffn_output_normed, axis=2, reduction="none"), axis=1))
             cosine_distance = 1 - cosine_distance
             if tf.executing_eagerly():
                 print('cosine distance shape (after ffn): {}'.format(cosine_distance.shape))
@@ -1443,6 +1439,7 @@ class AlbertModelWithACT(object):
             input_tensor=self.embedding_output,
             attention_mask=input_mask,
             hidden_size=config.hidden_size,
+            act_max_steps=config.num_hidden_layers,
             num_hidden_layers=config.num_hidden_layers,
             num_hidden_groups=config.num_hidden_groups,
             num_attention_heads=config.num_attention_heads,

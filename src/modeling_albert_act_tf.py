@@ -478,7 +478,7 @@ class TFAlbertActLayer(tf.keras.layers.Layer):
         ffn_output = self.ffn_output(inputs=ffn_output)
         ffn_output = self.dropout(inputs=ffn_output, training=training)
         # hidden_states = self.full_layer_layer_norm(inputs=ffn_output + attention_outputs[0])
-        ffn_output = self.full_layer_layer_norm((ffn_output * update_weights) + (attention_outputs * (1 - update_weights)))
+        ffn_output = self.full_layer_layer_norm((ffn_output * update_weights) + (ffn_input * (1 - update_weights)))
 
         # add attentions if we output them
         # outputs = (hidden_states,) + attention_outputs[1:]
