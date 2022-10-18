@@ -316,7 +316,7 @@ class AlbertAct(nn.Module):
         n_updates: torch.Tensor,
     ) -> Tuple[torch.Tensor]:
 
-        p = self.activation(self.dense(state))
+        p = torch.sigmoid(self.dense(state))
         p = torch.squeeze(p, axis=-1)
 
         # Mask for inputs which have not halted yet
@@ -379,7 +379,7 @@ class AlbertActLayer(nn.Module):
         attention_outputs = self.attention(hidden_states, attention_mask, head_mask, output_attentions)
         
         update_weights, halting_probability, remainders, n_updates = self.act(
-            attention_outputs[0], halting_probability, remainders, n_updates) 
+            attention_outputs[0], halting_probability, remainders, n_updates)
         ffn_input = self.LayerNorm(\
            (attention_outputs[0] * update_weights.unsqueeze(-1).repeat(1, 1, attention_outputs[0].shape[-1])) + \
            (hidden_states * (1 - update_weights.unsqueeze(-1).repeat(1, 1, hidden_states.shape[-1]))))

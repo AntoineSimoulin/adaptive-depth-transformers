@@ -483,7 +483,7 @@ class TFAlbertActLayer(tf.keras.layers.Layer):
         # add attentions if we output them
         # outputs = (hidden_states,) + attention_outputs[1:]
 
-        return hidden_states, attention_mask, halting_probability, remainders, n_updates
+        return ffn_output, attention_mask, halting_probability, remainders, n_updates
 
 
 class TFAlbertActTransformer(tf.keras.layers.Layer):
@@ -504,7 +504,6 @@ class TFAlbertActTransformer(tf.keras.layers.Layer):
         self.albert_layer= TFAlbertActLayer(config, name="albert_layer")
 
     def should_continue(self, u0, u1, halting_probability, u2, n_updates):
-        del u0, u1, u2
         cond = tf.reduce_any(
             tf.math.logical_and(
                 tf.math.less(halting_probability, self.threshold),
@@ -529,6 +528,13 @@ class TFAlbertActTransformer(tf.keras.layers.Layer):
         remainders = tf.zeros(tf.shape(hidden_states)[slice(0, 2)], name="remainder")
         n_updates = tf.zeros(tf.shape(hidden_states)[slice(0, 2)], name="n_updates")
         
+        # tf.print('TFAlbertActTransformer')
+        # print('hidden_states:', hidden_states)
+        # print('attention_mask', attention_mask)
+        # print('head_mask', head_mask)
+        # print('halting_probability', halting_probability) 
+        # print('remainders', remainders)
+        # print('n_updates', n_updates)
         (hidden_states, attention_mask, halting_probability, remainders, n_updates) = tf.while_loop(
             cond=self.should_continue, 
             body=self.albert_layer,
