@@ -153,20 +153,3 @@ class AlbertActConfig(PretrainedConfig):
         self.classifier_dropout_prob = classifier_dropout_prob
         self.position_embedding_type = position_embedding_type
         self.act_epsilon = act_epsilon
-
-
-# Copied from transformers.models.bert.configuration_bert.BertOnnxConfig with Roberta->Albert
-class AlbertOnnxConfig(OnnxConfig):
-    @property
-    def inputs(self) -> Mapping[str, Mapping[int, str]]:
-        if self.task == "multiple-choice":
-            dynamic_axis = {0: "batch", 1: "choice", 2: "sequence"}
-        else:
-            dynamic_axis = {0: "batch", 1: "sequence"}
-        return OrderedDict(
-            [
-                ("input_ids", dynamic_axis),
-                ("attention_mask", dynamic_axis),
-                ("token_type_ids", dynamic_axis),
-            ]
-        )
