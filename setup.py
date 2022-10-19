@@ -12,7 +12,7 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/AntoineSimoulin/adaptive-depth-transformers",
-    download_url="https://github.com/AntoineSimoulin/adaptive-depth-transformers/archive/refs/tags/v0.0.1-alpha.tar.gz",
+    packages=['act'],
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
